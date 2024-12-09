@@ -10,76 +10,100 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import pkg from 'twilio';
+import { PrismaClient } from '@prisma/client';
 
+const prisma = new PrismaClient();
 dotenv.config();
 
 const { twiml: { VoiceResponse } } = pkg;
 
-// Ensure environment variables are set
+// Environment variables
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ELEVEN_LABS_API_KEY = process.env.ELEVEN_LABS_API_KEY;
 const MANAGER_PHONE = process.env.MANAGER_PHONE;
 
-console.log("Starting server...");
-console.log("OPENAI_API_KEY set:", !!OPENAI_API_KEY);
-console.log("ELEVEN_LABS_API_KEY set:", !!ELEVEN_LABS_API_KEY);
-console.log("MANAGER_PHONE set:", !!MANAGER_PHONE);
-
-if (!OPENAI_API_KEY || !ELEVEN_LABS_API_KEY || !MANAGER_PHONE) {
-    console.error("Missing required environment variables. Please set OPENAI_API_KEY, ELEVEN_LABS_API_KEY, and MANAGER_PHONE.");
-    process.exit(1);
-}
-
-// Get current directory name (equivalent to __dirname in CommonJS)
+// Server setup
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-
 const app = express();
 const port = process.env.PORT || 5000;
-
-console.log(`Server will start on port: ${port}`);
 
 // Middleware
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
-app.use(
-    session({
-        secret: 'supersecretkey', // For production, use a more secure secret
-        resave: false,
-        saveUninitialized: true,
-        cookie: { maxAge: 30 * 60 * 1000 },
-    })
-);
+app.use(session({
+    secret: 'supersecretkey',
+    resave: false,
+    saveUninitialized: true,
+    cookie: { maxAge: 30 * 60 * 1000 },
+}));
 
-app.use((req, res, next) => {
-    console.log(`Incoming request: ${req.method} ${req.originalUrl}`);
-    next();
-});
+// Booking function schema for GPT
+const bookingFunctionSchema = {
+    name: "collectBookingInformation",
+    description: "Collect booking information for temple puja services",
+    parameters: {
+        type: "object",
+        properties: {
+            name: {
+                type: "string",
+                description: "The name of the person making the booking"
+            },
+            email: {
+                type: "string",
+                description: "Email address for booking confirmation"
+            },
+            phone: {
+                type: "string",
+                description: "Phone number of the person making the booking"
+            },
+            pujaName: {
+                type: "string",
+                description: "Name of the puja being booked"
+            }
+        }
+    }
+};
 
-// Conversation history template
+// Conversation template
 const conversationHistoryTemplate = [
     {
         role: 'system',
-        content:
-            'You are Neela, a friendly and knowledgeable phone call assistant from the Albany Hindu Temple in Albany, NY. ' +
-            'Provide concise and helpful responses that are no longer than 2 lines. ' +
-            'If there are any questions that are not related to temple just tell them you can only answers related to the temple. ' +
-            'For anyone who want to make puja booking, collect their name, email address and Puja Name. ' +
-            'If you cannot answer a question or if the user asks for a manager or human, respond with exactly "TRANSFER_TO_MANAGER" as your message. ' +
-            'If you detect frustration or multiple repeated questions from the user, respond with "TRANSFER_TO_MANAGER".',
+        content: 'You are Neela, a friendly and knowledgeable phone call assistant from the Albany Hindu Temple in Albany, NY. ' +
+                'Provide concise and helpful responses that are no longer than 2 lines. ' +
+                'For puja bookings, collect name, email, phone, and puja name. ' +
+                'If you cannot answer a question or if the user asks for a manager, respond with "TRANSFER_TO_MANAGER".'
     },
     {
         role: 'assistant',
-        content: "Hello, I'm Neela from Albany Hindu Temple. How can I assist you today?",
-    },
+        content: "Hello, I'm Neela from Albany Hindu Temple. How can I assist you today?"
+    }
 ];
 
-// Helper function: Generate TTS audio
+// Database functions
+async function createBooking(bookingData) {
+    try {
+        const booking = await prisma.aI_Booking.create({
+            data: {
+                name: bookingData.name,
+                email: bookingData.email,
+                phone: bookingData.phone,
+                pujaName: bookingData.pujaName,
+            },
+        });
+        console.log(`New booking created - Puja: ${bookingData.pujaName}, Customer: ${bookingData.name}`);
+        return booking;
+    } catch (error) {
+        console.error(`Failed to create booking for ${bookingData.name} - Error: ${error.message}`);
+        throw error;
+    }
+}
+
+// Text to Speech function
 async function textToSpeech(text, sessionId) {
-    console.log(`textToSpeech called with text: "${text}"`);
     try {
         const response = await axios.post(
-            `https://api.elevenlabs.io/v1/text-to-speech/cgSgspJ2msm6clMCkdW9`,
+            'https://api.elevenlabs.io/v1/text-to-speech/cgSgspJ2msm6clMCkdW9',
             {
                 text: text,
                 model_id: 'eleven_turbo_v2_5',
@@ -97,25 +121,24 @@ async function textToSpeech(text, sessionId) {
 
         const audioPath = join(__dirname, 'audio', `${sessionId}.mp3`);
         writeFileSync(audioPath, response.data);
-        console.log(`Audio file written to ${audioPath}`);
         return audioPath;
     } catch (error) {
-        console.error('Error in textToSpeech:', error.message);
+        console.error(`Text-to-speech conversion failed for session ${sessionId} - Error: ${error.message}`);
         return null;
     }
 }
 
-// Helper function: Generate GPT response
-async function generateResponse(userInput, conversationHistory) {
-    console.log(`generateResponse called with userInput: "${userInput}"`);
-    console.log("Current conversationHistory:", conversationHistory);
+// Generate GPT response
+async function generateResponse(userInput, conversationHistory, bookingInfo = {}) {
     try {
         const response = await axios.post(
             'https://api.openai.com/v1/chat/completions',
             {
                 model: 'gpt-4',
                 messages: conversationHistory,
-                max_tokens: 50,
+                functions: [bookingFunctionSchema],
+                function_call: "auto",
+                max_tokens: 150,
                 temperature: 0.7,
             },
             {
@@ -126,64 +149,93 @@ async function generateResponse(userInput, conversationHistory) {
             }
         );
 
-        const gptAnswer = response.data.choices[0].message.content;
-        console.log(`GPT Response: ${gptAnswer}`);
-        return gptAnswer;
+        const responseMessage = response.data.choices[0].message;
+
+        if (responseMessage.function_call) {
+            const functionArgs = JSON.parse(responseMessage.function_call.arguments);
+            const updatedBookingInfo = { ...bookingInfo, ...functionArgs };
+            
+            // Check if we have all required booking information
+            if (updatedBookingInfo.name && 
+                updatedBookingInfo.email && 
+                updatedBookingInfo.phone && 
+                updatedBookingInfo.pujaName) {
+                
+                await createBooking(updatedBookingInfo);
+                return {
+                    response: "Perfect! I've recorded your booking for the puja. You'll receive a confirmation email shortly. Is there anything else you need help with?",
+                    bookingInfo: null // Reset booking info after successful booking
+                };
+            }
+
+            // Ask for missing information
+            const missingFields = [];
+            if (!updatedBookingInfo.name) missingFields.push("your name");
+            if (!updatedBookingInfo.email) missingFields.push("your email address");
+            if (!updatedBookingInfo.phone) missingFields.push("your phone number");
+            if (!updatedBookingInfo.pujaName) missingFields.push("which puja you'd like to book");
+
+            const response = missingFields.length === 1
+                ? `Could you please provide ${missingFields[0]}?`
+                : `I'll help you with the booking. Could you please provide ${missingFields.join(", ")}?`;
+
+            return {
+                response,
+                bookingInfo: updatedBookingInfo
+            };
+        }
+
+        return {
+            response: responseMessage.content,
+            bookingInfo
+        };
+
     } catch (error) {
-        console.error('Error in generateResponse:', error.message);
-        return "TRANSFER_TO_MANAGER";
+        console.error(`GPT response generation failed - Error: ${error.message}`);
+        return {
+            response: "TRANSFER_TO_MANAGER",
+            bookingInfo
+        };
     }
 }
 
-// Helper function: Clean up audio files
+// Cleanup function
 async function cleanupAudioFile(sessionId) {
     const audioPath = join(__dirname, 'audio', `${sessionId}.mp3`);
-    console.log(`cleanupAudioFile called for session: ${sessionId}`);
     try {
         if (existsSync(audioPath)) {
             unlinkSync(audioPath);
-            console.log(`Audio file ${audioPath} deleted.`);
+            console.log(`Audio file cleaned up for session ${sessionId}`);
         }
     } catch (error) {
-        console.error('Error cleaning up audio file:', error);
+        console.error(`Failed to cleanup audio file for session ${sessionId} - Error: ${error.message}`);
     }
 }
 
 // Routes
 app.get('/', (req, res) => {
-    console.log("GET / - Sending welcome message.");
     res.send('Welcome to the Albany Hindu Temple Call Handling System');
 });
 
 app.post('/voice', async (req, res) => {
-    console.log("POST /voice");
     const twiml = new VoiceResponse();
-
     try {
         req.session.sessionId = uuidv4();
         req.session.conversationHistory = [...conversationHistoryTemplate];
-        req.session.transferAttempts = 0;
+        req.session.bookingInfo = {};
 
-        console.log("New call session initiated:", req.session.sessionId);
-        
         const initialMessage = req.session.conversationHistory[1].content;
-        console.log("Initial message:", initialMessage);
-        
         const audioPath = await textToSpeech(initialMessage, req.session.sessionId);
-
         const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
-        console.log("baseUrl used for TwiML:", baseUrl);
 
         if (audioPath) {
-            console.log("Playing TTS audio");
             twiml.play(`${baseUrl}/stream_audio/${req.session.sessionId}`);
         } else {
-            console.log("Fallback to TwiML say");
             twiml.say(initialMessage);
         }
         twiml.redirect('/gather');
     } catch (error) {
-        console.error('Error in /voice:', error.message);
+        console.error(`Voice endpoint error for session ${req.session.sessionId} - Error: ${error.message}`);
         twiml.say('An error occurred. Please try again later.');
     }
 
@@ -191,11 +243,8 @@ app.post('/voice', async (req, res) => {
 });
 
 app.post('/gather', (req, res) => {
-    console.log("POST /gather");
     const twiml = new VoiceResponse();
-
     try {
-        console.log("Prompting user for speech input");
         twiml.gather({
             input: 'speech',
             action: '/process_speech',
@@ -203,77 +252,59 @@ app.post('/gather', (req, res) => {
             language: 'en-US',
         });
     } catch (error) {
-        console.error('Error in /gather:', error.message);
+        console.error(`Gather endpoint error for session ${req.session.sessionId} - Error: ${error.message}`);
         twiml.say('An error occurred. Please try again later.');
     }
-
     res.type('text/xml').send(twiml.toString());
 });
 
 app.post('/process_speech', async (req, res) => {
-    console.log("POST /process_speech");
     const twiml = new VoiceResponse();
     const userInput = req.body.SpeechResult;
     const sessionId = req.session.sessionId;
 
-    console.log(`User said: "${userInput}"`);
-    
     if (!userInput) {
-        console.log("No user input captured");
-        twiml.say("Sorry, I didn't catch that. Could you please repeat?");
+        twiml.say("I'm sorry, I didn't catch that. Could you please repeat?");
         twiml.redirect('/gather');
         return res.type('text/xml').send(twiml.toString());
     }
 
     try {
         const conversationHistory = req.session.conversationHistory || [...conversationHistoryTemplate];
-
         conversationHistory.push({ role: 'user', content: userInput });
-        console.log("Updated conversationHistory:", conversationHistory);
-        
-        const gptResponse = await generateResponse(userInput, conversationHistory);
 
-        if (gptResponse === 'TRANSFER_TO_MANAGER') {
-            console.log("GPT instructed to transfer to manager.");
-            req.session.transferAttempts = (req.session.transferAttempts || 0) + 1;
-            console.log("Transfer attempts:", req.session.transferAttempts);
+        const { response, bookingInfo } = await generateResponse(
+            userInput, 
+            conversationHistory, 
+            req.session.bookingInfo
+        );
 
-            if (req.session.transferAttempts >= 3) {
-                console.log("Manager not available after 3 attempts");
-                twiml.say("I apologize, but our manager seems unavailable at the moment. Please try calling back later.");
-                await cleanupAudioFile(sessionId);
-                return res.type('text/xml').send(twiml.toString());
-            }
-
+        if (response === 'TRANSFER_TO_MANAGER') {
+            console.log(`Call transfer initiated for session ${sessionId}`);
             twiml.say("I'll transfer you to our manager now. Please hold.");
-            twiml.dial({
-                action: '/handle_transfer_result',
-                timeout: 20,
-            }, MANAGER_PHONE);
-
-            return res.type('text/xml').send(twiml.toString());
-        }
-
-        console.log("Normal response from GPT:", gptResponse);
-        conversationHistory.push({ role: 'assistant', content: gptResponse });
-        req.session.conversationHistory = conversationHistory;
-
-        const audioPath = await textToSpeech(gptResponse, sessionId);
-
-        const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
-        console.log("baseUrl used for TwiML:", baseUrl);
-
-        if (audioPath) {
-            console.log("Playing GPT response audio");
-            twiml.play(`${baseUrl}/stream_audio/${sessionId}`);
+            const dial = twiml.dial({
+                action: '/handle-dial-status',
+                method: 'POST',
+                timeout: 20
+            });
+            dial.number(MANAGER_PHONE);
         } else {
-            console.log("Falling back to TwiML say for GPT response");
-            twiml.say(gptResponse);
-        }
+            conversationHistory.push({ role: 'assistant', content: response });
+            req.session.conversationHistory = conversationHistory;
+            req.session.bookingInfo = bookingInfo;
 
-        twiml.redirect('/gather');
+            const audioPath = await textToSpeech(response, sessionId);
+            const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
+
+            if (audioPath) {
+                twiml.play(`${baseUrl}/stream_audio/${sessionId}`);
+            } else {
+                twiml.say(response);
+            }
+            twiml.redirect('/gather');
+        }
     } catch (error) {
-        console.error('Error in /process_speech:', error.message);
+        console.error(`Speech processing error for session ${sessionId} - Error: ${error.message}`);
         twiml.say('An error occurred. Please try again later.');
         await cleanupAudioFile(sessionId);
     }
@@ -281,55 +312,62 @@ app.post('/process_speech', async (req, res) => {
     res.type('text/xml').send(twiml.toString());
 });
 
-app.post('/handle_transfer_result', (req, res) => {
-    console.log("POST /handle_transfer_result");
+app.post('/handle-dial-status', async (req, res) => {
     const twiml = new VoiceResponse();
     const dialCallStatus = req.body.DialCallStatus;
-
-    console.log("Dial Call Status:", dialCallStatus);
+    const sessionId = req.session.sessionId;
 
     if (dialCallStatus !== 'completed') {
-        console.log("Manager not reached");
-        twiml.say("I apologize, but I couldn't reach our manager. Let me try to help you instead.");
-        twiml.redirect('/gather');
+        console.log(`Manager transfer failed for session ${sessionId} - Status: ${dialCallStatus}`);
+        const message = "I apologize, but our manager is currently unavailable. I'll continue to assist you. What can I help you with?";
+        
+        try {
+            req.session.conversationHistory = [...conversationHistoryTemplate];
+            const audioPath = await textToSpeech(message, sessionId);
+            const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
+
+            if (audioPath) {
+                twiml.play(`${baseUrl}/stream_audio/${sessionId}`);
+            } else {
+                twiml.say(message);
+            }
+            twiml.redirect('/gather');
+        } catch (error) {
+            console.error(`Dial status handling error for session ${sessionId} - Error: ${error.message}`);
+            twiml.say('An error occurred. Please try again later.');
+        }
+    } else {
+        console.log(`Call successfully transferred to manager for session ${sessionId}`);
+        twiml.hangup();
     }
 
     res.type('text/xml').send(twiml.toString());
 });
 
 app.get('/stream_audio/:sessionId', (req, res) => {
-    console.log(`GET /stream_audio/${req.params.sessionId}`);
     const audioPath = join(__dirname, 'audio', `${req.params.sessionId}.mp3`);
-
     if (existsSync(audioPath)) {
-        console.log(`Streaming audio file: ${audioPath}`);
         res.setHeader('Content-Type', 'audio/mpeg');
         const stream = createReadStream(audioPath);
         stream.pipe(res);
         stream.on('end', () => {
             cleanupAudioFile(req.params.sessionId)
-                .catch(error => console.error('Error cleaning up audio file:', error));
+                .catch(error => console.error(`Audio streaming cleanup error for session ${req.params.sessionId} - Error: ${error.message}`));
         });
     } else {
-        console.log("Audio file not found:", audioPath);
+        console.error(`Audio file not found for session ${req.params.sessionId}`);
         res.status(404).send('Audio file not found');
     }
 });
 
-// Ensure audio directory exists
+// Create audio directory if it doesn't exist
 const audioDir = join(__dirname, 'audio');
 if (!existsSync(audioDir)) {
     mkdirSync(audioDir);
-    console.log("Created audio directory:", audioDir);
+    console.log('Audio directory created');
 }
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-    console.error("Unhandled error:", err.stack);
-    res.status(500).send('Something broke!');
-});
 
 // Start server
 app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+    console.log(`Temple call handling system running on port ${port}`);
 });
