@@ -4,7 +4,9 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "prisma:generate": "prisma generate",         
+    "prisma:migrate": "prisma migrate deploy",     
+    "start": "npm run prisma:generate && node app.js"
   },
   "keywords": [],
   "author": "",
